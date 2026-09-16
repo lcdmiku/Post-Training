@@ -1,14 +1,8 @@
 import math,torch,torch.nn.functional as F
-
-import pylab as p
-from einops import layers
 from torch import nn
-from torch.compiler import config
 from transformers.activations import ACT2FN
 from transformers import PretrainedConfig,PreTrainedModel,GenerationMixin
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
-from transformers.modeling_tf_utils import init_copy_embeddings
-
 
 #模型配置
 class MiniMindConfig(PretrainedConfig):
@@ -96,65 +90,61 @@ def repeat_kv(x:torch.Tensor,n_rep:int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self,config : MiniMindConfig):
-        super(Attention, self).__init__()
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
-        self.n_local_kv_heads = config.num_key_value_heads
+        self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.head_dim
         self.is_causal = True
-        self.q_proj = nn.Linear(config.hidden_size,config.num_attention_heads * self.head_dim,bias=False)
-        self.k_proj = nn.Linear(config.hidden_size,config.num_key_value_heads * self.head_dim,bias=False)
-        self.v_proj = nn.Linear(config.hidden_size,config.num_key_value_heads * self.head_dim,bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim,config.hidden_size,bias=False)
-        self.q_norm = RMSNorm(config.hidden_size,eps = config.rms_norm_eps)
-        self.k_norm = RMSNorm(config.hidden_size,eps = config.rms_norm_eps)
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional,'scaled_dot_product_attention') and config.flash_attn
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-        def forward(self,x,position_embeddings,past_key_value=None,use_cache=False,attention_mask=None):
-            bsz,seq_len,_ = x.shape
-            xq,xk,xv = self.q_proj(x),self.k_proj(x),self.v_proj(x)
-            xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
-            xk = xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
-            xv = xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
-            xq,xk = self.q_norm(xq),self.k_norm(xk)
-            cos,sin = position_embeddings
-            xq,xk = apply_rotary_pos_emb(xq,xk,cos,sin)
-            #拼接之前的KV缓存
-            if past_key_value is not None:
-                xk = torch.cat([past_key_value[0],xk],dim=1)
-                xv = torch.cat([past_key_value[1],xv],dim=1)
-            past_kv = (xk,xv) if use_cache else None
-            xq,xk,xv = (xq.transpose(1,2),repeat_kv(xk,self.n_rep).transpose(1,2),repeat_kv(xv,self.n_rep).transpose(1,2))
-            if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch or torch.all(attention_mask==1)):
-                #prefixed prompt
-                output = F.scaled_dot_product_attention(xq,xk,xv,dropout_p=self.dropout if self.training else 0.0,is_causal=self.is_causal)
-            else:
-                scores = (xq @ xk.transpose(-1,-2),xv @ xk.transpose(-2,-1)) / math.sqrt(self.hidden_dim)
-                if self.is_causal:
-                    scores[:,:,:,-seq_len:] += torch.full((seq_len,seq_len),float('-inf'),device=scores.device).triu(1)
-                if attention_mask is not None:
-                    scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * 1e-9
-                    output = self.attn_dropout(F.softmax(scores.float(),dim=-1).type_as(xq)) @ xv
-                output = output.transpose(1,2).reshape(bsz,seq_len,-1)
-                output = self.resid_dropout(self.o_proj(output))
-            return output,past_kv
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
 
 class FeedForward(nn.Module):
     def __init__(self,config : MiniMindConfig,intermediate_size : int = None):
         super(FeedForward, self).__init__()
         intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(config.hidden_size,config.intermediate_size,bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size,config.hidden_size,bias=False)
-        self.up_proj = nn.Linear(config.hidden_size,config.intermediate_size,bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size,intermediate_size,bias=False)
+        self.down_proj = nn.Linear(intermediate_size,config.hidden_size,bias=False)
+        self.up_proj = nn.Linear(config.hidden_size,intermediate_size,bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self,x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(self.down_proj(x)))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class MOEFeedForward(nn.Module):
     def __init__(self,config : MiniMindConfig):
@@ -199,7 +189,8 @@ class MiniMindBlock(nn.Module):
         hidden_states,present_key_value = self.self_attn(
             self.input_attention_layernorm(hidden_states),
             position_embeddings,
-            past_key_value,use_cache=use_cache,attention_mask=attention_mask
+            use_cache = use_cache,
+            past_key_value=past_key_value,attention_mask=attention_mask
         )
         hidden_states += residual
         hidden_states = hidden_states +  self.mlp(self.post_attention_layernorm(hidden_states))
@@ -215,18 +206,18 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l,config) for l in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size,eps = config.rms_norm_eps)
-        freqs_cos,freqs_sin = precomputer_freqs_cis(dim=config.hidden_size,
+        freqs_cos,freqs_sin = precomputer_freqs_cis(dim=config.head_dim,
                                                     end=config.max_position_embeddings,
-                                                    rope_base=config.rope_base,
+                                                    rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling,)
         self.register_buffer('freqs_cos',freqs_cos,persistent=False)
         self.register_buffer('freqs_sin',freqs_sin,persistent=False)
 
-    def forward(self,input_ids,attention_mask=None,past_key_value=None,use_cache=False,**kwargs):
+    def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False,**kwargs):
         batch_size,seq_len = input_ids.shape
-        if hasattr(past_key_value,'layer'):past_key_value = None
-        past_key_value = past_key_value or [None] * len(self.layers)
-        start_pos = past_key_value[0][0].shape[0] if past_key_value is not None else 0
+        if hasattr(past_key_values,'layer'):past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)
+        start_pos = past_key_values[0][0].shape[0] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         if self.freqs_cos[0,0] == 0:
             freqs_cos,freqs_sin = precomputer_freqs_cis(dim=self.config.hidden_size,
@@ -237,7 +228,7 @@ class MiniMindModel(nn.Module):
             self.freqs_sin = freqs_sin.to(hidden_states.device)
         position_embeddings = (self.freqs_cos[start_pos:start_pos+seq_len],self.freqs_sin[start_pos:start_pos+seq_len])
         presents = []
-        for layer,past_key_value in zip(self.layers,past_key_value):
+        for layer,past_key_value in zip(self.layers,past_key_values):
             hidden_states,present = layer(
                 hidden_states,
                 position_embeddings,
@@ -255,25 +246,25 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
     _tied_weights_keys = {"lm_head.weight":"model.embed_tokens.weight"}
     def __init__(self,config : MiniMindConfig = None):
         self.config = config or MiniMindConfig()
-        super(MiniMindForCausalLM,self).__init__()
+        super(MiniMindForCausalLM,self).__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size,self.config.vocab_size,bias=False)
         if self.config.tie_word_embeddings:self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
 
-    def forward(self,input_ids,attention_mask=None,past_key_value=None,use_cache=False,logits_to_keep=0,labels=None,**kwargs):
-        hidden_states,past_key_value ,aux_loss = self.model(input_ids,attention_mask,past_key_value=past_key_value,use_cache=use_cache,**kwargs)
+    def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False,logits_to_keep=0,labels=None,**kwargs):
+        hidden_states,past_key_values ,aux_loss = self.model(input_ids,attention_mask,past_key_values=past_key_values,use_cache=use_cache,**kwargs)
         slice_indices = slice(-logits_to_keep,None) if isinstance(logits_to_keep,int) else logits_to_keep
         logits = self.lm_head(hidden_states[:,slice_indices,:])
         loss = None
         if labels is not None:
             #训练阶段
             x,y = logits[...,:-1,:].contiguous(),labels[...,1:].contiguous()
-            loss = F.cross_entropy(x.view(-1,x.size(-1)),y.view(-1,1),ignore_index=-100)
+            loss = F.cross_entropy(x.view(-1,x.size(-1)),y.view(-1),ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss,
                                          logits=logits,
                                          aux_loss=aux_loss,
-                                         past_key_value=past_key_value,
+                                         past_key_values=past_key_values,
                                          hidden_states=hidden_states,)
 
     # https://github.com/jingyaogong/minimind/discussions/611

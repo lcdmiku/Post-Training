@@ -3,11 +3,16 @@ __pycache__/
 .idea/
 *.py[codz]
 *$py.class
+*.pyc
+.DS_Store
+out
+website/
+docs-minimind/
 
 # Large File
 #dataset
 dataset/*
-!dataset/im_dataset.py
+!dataset/lm_dataset.py
 
 #model
 minimind-3/
