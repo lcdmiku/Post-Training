@@ -25,6 +25,67 @@ from trainer.rollout_engine import create_rollout_engine
 
 warnings.filterwarnings('ignore')
 
+def rep_penalty(text, n=3, cap=0.5):
+    toks = re.findall(r"\w+|[^\w\s]", text.lower())
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
+
+
+# 自定义的Critic模型，继承自MiniMindLM
+class CriticModel(MiniMindForCausalLM):
+    def __init__(self, params):
+        super().__init__(params)
+        # lm_head 不参与 forward，仅靠 tie_word_embeddings 与 embed_tokens 共享权重，解绑后 DDP 会报未使用参数
+        self.value_head = nn.Linear(params.hidden_size, 1)
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        # 使用基础模型获取隐藏状态
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        hidden_states = self.model.norm(outputs[0])
+        # 使用value_head获取价值估计
+        values = self.value_head(hidden_states).squeeze(-1)
+        return values
+
+
+def calculate_rewards(prompts, responses, reward_model):
+    rewards = torch.zeros(len(responses), device=args.device)
+
+    with torch.no_grad():
+        reward_model_scores = []
+        for i, (prompt, response) in enumerate(zip(prompts, responses)):
+            pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
+            matches = re.findall(pattern, prompt, re.DOTALL)
+            messages = [{"role": role, "content": content.strip()} for role, content in matches]
+            answer = response
+            rewards[i] += 0.5 if 20 <= len(response.strip()) <= 800 else -0.5
+            if '</think>' in response:
+                thinking_content, answer_content = response.split('</think>', 1)
+                rewards[i] += 1.0 if 20 <= len(thinking_content.strip()) <= 300 else -0.5
+                rewards[i] += 0.25 if response.count('</think>') == 1 else -0.25
+                answer = answer_content.strip()
+            rewards[i] -= rep_penalty(answer)
+
+            score = reward_model.get_score(messages, answer)
+            reward_model_scores.append(score)
+
+        reward_model_scores = torch.tensor(reward_model_scores, device=args.device)
+        rewards += reward_model_scores
+
+    return rewards
+
+def ppo_train_epoch(epoch,loader,iters,rollout_engine,ref_model,actor_scheduler,critic_scheduler,reward_model,start_step=0,wandb=None):
+    actor_model.train()
+    critic_model.train()
+    last_step = start_step
+
+    for step,batch in enumerate(loader,start=start_step+1):
+        prompts = batch['prompt'] #list[str] : B
+        enc = tokenizer(prompts, return_tensors="pt",padding=True,truncation=True,max_length=args.max_seq_len,
+                        padding_size='left').to(args.device)
+        rollout_res = rollout_engine.rollout(
+            prompt_ids = enc.input_ids,
+            attention_mask = enc.attention_mask,
+        )
 
 
 if __name__ == "__main__":
@@ -164,7 +225,7 @@ if __name__ == "__main__":
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch);
+        setup_seed(42 + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
