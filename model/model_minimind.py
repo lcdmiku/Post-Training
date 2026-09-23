@@ -6,6 +6,7 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 #模型配置
 class MiniMindConfig(PretrainedConfig):
+    model_type = 'minimind'
     def __init__(self, hidden_size=768,num_hidden_layers=8,use_moe=False,**kwargs):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
@@ -65,9 +66,10 @@ def precomputer_freqs_cis(dim:int,end:int=int(32*1024),rope_base:float=1e6,rope_
             rope_scaling.get("attn_factor",1.)
         )
         if end / orig_max > 1.0:
-            inv_dim = lambda b:(dim * math.log(orig_max / (b*2*math.pi)) / 2*(math.log(rope_base)))
+            inv_dim = lambda b:(dim * math.log(orig_max / (b*2*math.pi) )) / (2 * math.log(rope_base))
             low,high = max(math.floor(inv_dim(beta_fast)),0),min(math.ceil(inv_dim(beta_slow)),dim//2 -1)
-            ramp = torch.clamp((torch.arange(dim//2,device=freqs.device).float()),0,1)
+            ramp = torch.clamp(((torch.arange(dim//2,device=freqs.device).float()) - low) / max(high - low,0.001)
+                               ,0,1)
             freqs = freqs * (1 - ramp + ramp / factor)
     t = torch.arange(end,device=freqs.device)
     freqs = torch.outer(t,freqs).float()
@@ -126,10 +128,10 @@ class Attention(nn.Module):
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+            output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
@@ -159,21 +161,26 @@ class MOEFeedForward(nn.Module):
         x_flat = x.view(-1,hidden_size)
         scores = F.softmax(self.gate_proj(x_flat),dim=-1)
         topk_weight,topk_idx = torch.topk(scores,k=self.config.num_experts_per_tok,dim=-1,sorted = False)
-        if self.config.norm_topk_prob:topk_weight /= (torch.sum(topk_weight,dim=-1,keepdim = True) + 1e-20)
+        if self.config.norm_topk_prob:
+            if self.config.num_experts_per_tok>1:
+                topk_weight = topk_weight / (torch.sum(topk_weight,dim=-1,keepdim = True) + 1e-20)
+            else:
+                top1,_ = torch.topk(F.softmax(self.gate_proj(x_flat.detach()),dim=-1),k=1,dim=-1,sorted = False)
+                topk_weight = top1 - top1.detach() + 1.0
         y = torch.zeros_like(x_flat)
         for i,expert in enumerate(self.experts):
             mask = (topk_idx == i)
             if mask.any():
                 token_idx = mask.any(dim = -1).nonzero().flatten()
                 weight = topk_weight[mask].view(-1,1)
-                y.index_add_(0,token_idx,expert(weight * x_flat[token_idx]).to(y.dtype))
+                y.index_add_(0,token_idx,(expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
-                y[0,0] += 0 * sum(p.sum() for p in self.expert.parameters())
-            if self.training and self.config.router_aux_loss_coef > 0:
-                load = F.one_hot(topk_idx,self.config.num_experts).float().mean(0)
-                self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
-            else:
-                self.aux_loss = scores.new_zeros(1).squeeze()
+                y[0,0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx,self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size,seq_len,hidden_size)
 
 class MiniMindBlock(nn.Module):
@@ -215,14 +222,14 @@ class MiniMindModel(nn.Module):
 
     def forward(self,input_ids,attention_mask=None,past_key_values=None,use_cache=False,**kwargs):
         batch_size,seq_len = input_ids.shape
-        if hasattr(past_key_values,'layer'):past_key_values = None
+        if hasattr(past_key_values,'layers'):past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[0] if past_key_values[0] is not None else 0
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         if self.freqs_cos[0,0] == 0:
-            freqs_cos,freqs_sin = precomputer_freqs_cis(dim=self.config.hidden_size,
+            freqs_cos,freqs_sin = precomputer_freqs_cis(dim=self.config.head_dim,
                                                         end=self.config.max_position_embeddings,
-                                                        rope_base=self.config.rope_base,
+                                                        rope_base=self.config.rope_theta,
                                                         rope_scaling=self.config.rope_scaling,)
             self.freqs_cos = freqs_cos.to(hidden_states.device)
             self.freqs_sin = freqs_sin.to(hidden_states.device)
@@ -277,7 +284,7 @@ class MiniMindForCausalLM(PreTrainedModel,GenerationMixin):
         if streamer: streamer.put(input_ids.cpu())
         for _ in range(max_new_tokens):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
+            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, logits_to_keep = 1,**kwargs)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
             if repetition_penalty != 1.0:

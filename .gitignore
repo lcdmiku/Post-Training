@@ -16,6 +16,7 @@ dataset/*
 
 #model
 minimind-3/
+internlm2-1_8b-reward/
 
 # C extensions
 *.so
