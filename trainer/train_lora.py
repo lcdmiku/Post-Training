@@ -25,15 +25,16 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, lora_params,start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
-    for step,(input_ids,labels) in enumerate(loader,start_step = start_step+1):
-        input_ids = input_ids.to(model.device)
-        labels = labels.to(model.device)
+    for step,(input_ids,labels) in enumerate(loader,start = start_step+1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
         last_step = step
         lr = get_lr(epoch*iters + step,args.epochs*iters,args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
+
         with autocast_ctx:
-            res = model(input_ids,labels,lora_params)
+            res = model(input_ids,labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -179,7 +180,7 @@ if __name__ == "__main__":
     # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch);
+        setup_seed(42 + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)

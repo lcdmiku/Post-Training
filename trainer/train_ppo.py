@@ -77,15 +77,221 @@ def ppo_train_epoch(epoch,loader,iters,rollout_engine,ref_model,actor_scheduler,
     actor_model.train()
     critic_model.train()
     last_step = start_step
+    grad_accum_step = 0
 
     for step,batch in enumerate(loader,start=start_step+1):
+        # 计算old策略
         prompts = batch['prompt'] #list[str] : B
         enc = tokenizer(prompts, return_tensors="pt",padding=True,truncation=True,max_length=args.max_seq_len,
-                        padding_size='left').to(args.device)
+                        padding_side='left').to(args.device)
         rollout_res = rollout_engine.rollout(
             prompt_ids = enc.input_ids,
             attention_mask = enc.attention_mask,
+            num_generations=1,#每个prompt只生成一个回答
+            max_new_tokens=args.max_gen_len,
+            temperature=0.8,
         )
+        gen_out = rollout_res.output_ids # [B , P+R]
+        completion_ids = rollout_res.completion_ids #[B , R ]
+        prompt_lens = rollout_res.prompt_lens.to(args.device) # B, 采用固定长度 P
+        responses_text = rollout_res.completions #文本数据
+        old_resp_logp = rollout_res.per_token_logps.to(args.device) #[B,R] old策略的概率，对应的koken是要后面改变的
+        rewards = calculate_rewards(prompts, responses_text, reward_model) # B #得到B个序列的奖励，用来计算每个token的广义优势函数
+
+        # mask -> full_mask , resp_policy_mask,resp_value_mask
+        full_mask = (gen_out != tokenizer.pad_token_id).long() # # [B, P + R]
+        resp_labels = completion_ids # [B, R]
+        resp_idx = torch.arange(resp_labels.size(1),device=gen_out.device).unsqueeze(0) # 1,R
+        logp_pos = prompt_lens.unsqueeze(1) - 1 + resp_idx # [B, R] #
+        resp_policy_mask = rollout_res.completion_mask.to(args.device) # [B, R] #除去pad与多余的eos
+        resp_value_mask = resp_policy_mask.clone()
+        resp_lengths = (resp_value_mask.sum(dim=-1)).long() #[B*num_gen,]
+        valid_mask = (resp_lengths > 0) #[B*num_gen,]
+        full_mask.scatter_(dim=1, index=logp_pos + 1, src=resp_policy_mask.long())
+
+        labels = gen_out[:,1:] # [B*num_gen, P+R-1]
+        B = len(gen_out)
+
+        with torch.no_grad():
+            critic_model_raw = critic_model.module if isinstance(critic_model,DistributedDataParallel) else critic_model
+            values_seq = critic_model_raw(input_ids=gen_out,attention_mask=full_mask) # [B, P+R]
+            old_resp_values = values_seq.gather(1,logp_pos) * resp_value_mask # [B, R] 得到resp处的状态值
+
+            ref_resp_logp = F.log_softmax(
+                ref_model(input_ids=gen_out,attention_mask=full_mask).logits[:,:-1],dim=-1, # [B, P+R-1,VS]
+            ).gather(-1,labels.unsqueeze(-1)).squeeze(-1).gather(1,logp_pos) # [B, R]参考策略对应位置的对数概率，求kl散度
+
+            last_idx = resp_lengths - 1 #[B，]
+            token_rewards = torch.zeros_like(old_resp_logp) #[B,R] #开始计算token级别奖励,只有最后一个token非零
+            #给最后一个token赋予奖励，其余位置置零(使用valid_mask过滤出合格的seq)
+            token_rewards[torch.arange(B,device=args.device)[valid_mask],last_idx[valid_mask]] += rewards[valid_mask]
+            gen_len = old_resp_values.size(1) # R
+            lastgaelam = torch.zeros(B,device=args.device) #迭代求gae
+            advs_rev = [] #从后到前的gae
+
+            for t in reversed(range(gen_len)):
+                next_val = old_resp_values[:,t+1] if t < gen_len-1 else 0.0 #末尾token的下一个状态值为0
+                delta = token_rewards[:,t] + args.gamma * next_val - old_resp_values[:,t] #
+                lastgaelam = delta + args.gamma * args.lam * lastgaelam
+                advs_rev.append(lastgaelam)
+            #得到每个token的广义优势函数
+            advantages = torch.stack(advs_rev[::-1],dim=1) # [ B,R ] #正序重排列
+            returns = advantages + old_resp_values # 更新value模型时所用的目标
+            adv_mean = (advantages * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
+            adv_var = ((advantages - adv_mean) ** 2 * resp_policy_mask).sum() / resp_policy_mask.sum().clamp(min=1)
+            advantages = (advantages - adv_mean) * torch.rsqrt(adv_var + 1e-8) * resp_policy_mask #将advances标准化
+
+        # 开始更新策略，每次小幅度更新的数据量为 mb_size
+        mb_size = max(1,min(args.mini_batch_size,B))
+        stop_ppo = False
+        policy_loss_sum = 0.
+        value_loss_sum = 0.
+        kl_sum = 0.
+        kl_ref_sum = 0.
+        clipfrac_sum = 0.
+        aux_loss_sum = 0.
+        log_count = 0
+        for ppo_epoch in range(args.ppo_update_iters):
+            #ppo_update_iters表示每一批old策略用来更新几次
+            if stop_ppo:
+                break
+            b_inds = torch.randperm(B,device=args.device)
+            for i in range(0,B,mb_size):
+                inds = b_inds[i:i+mb_size]
+                mb_values_seq = critic_model(input_ids=gen_out[inds],attention_mask=full_mask[inds]) #新的value模型对生成数据的状态评分
+                mb_resp_values = mb_values_seq.gather(1,logp_pos[inds]) # 取resp部分的值
+
+                with autocast_ctx:
+                    res = actor_model(input_ids = gen_out[inds],attention_mask = full_mask[inds])
+                    aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0,device=args.device)
+                    mb_resp_logp = F.log_softmax(res.logits[:, :-1], dim=-1).gather(2, labels[inds].unsqueeze(
+                        -1)).squeeze(-1).gather(1, logp_pos[inds]) # 最新策略对同一种状态和动作的概率
+
+                log_ratio = mb_resp_logp - old_resp_logp[inds] # (mB,R) # new old ratio
+
+                # 可开关的诊断：观察首轮首个 minibatch 的 mb 与 old logp 差异。
+                if args.debug_log_ratio and ppo_epoch == 0 and i == 0 and is_main_process():
+                    _lr = log_ratio.detach()
+                    _m = resp_policy_mask[inds].bool()
+                    if _m.any():
+                        _lrv = _lr[_m]
+                        Logger(f"[DBG log_ratio] step={step} max|lr|={_lrv.abs().max().item():.6e} "
+                               f"mean|lr|={_lrv.abs().mean().item():.6e} "
+                               f"ratio_max={torch.exp(_lrv).max().item():.6f} "
+                               f"ratio_min={torch.exp(_lrv).min().item():.6f} "
+                               f"dropout={getattr(lm_config, 'dropout', None)} "
+                               f"training={actor_model.training}")
+                approx_kl = (0.5 * (log_ratio ** 2) * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
+                # 同步各卡的 approx_kl，防止某卡 break 而其它卡继续导致 DDP 死锁
+                approx_kl_val = approx_kl.detach().clone()
+                if dist.is_initialized():
+                    dist.all_reduce(approx_kl_val, op=dist.ReduceOp.AVG)
+
+                if approx_kl_val > args.early_stop_kl:
+                    stop_ppo = True
+
+                ########################
+                ratio = torch.exp(log_ratio) #(mB,R)
+                clipfrac = ((((ratio-1.0).abs() > args.clip_epsilon).float() * resp_policy_mask[inds]).sum()) / (resp_policy_mask[inds].sum().clamp(min=1))
+
+                kl_ref_penalty = ((((mb_resp_logp - ref_resp_logp[inds]) + (torch.exp(ref_resp_logp[inds]-mb_resp_logp)) - 1.0) * resp_policy_mask[inds]).sum()
+                                    / resp_policy_mask[inds].sum().clamp(min=1))
+
+                policy_loss = ((torch.max(-advantages[inds] * ratio ,
+                                          -advantages[inds] * torch.clamp(ratio,1.0 - args.clip_epsilon,1.0 + args.clip_epsilon)
+                                          ) * resp_policy_mask[inds]).sum() / resp_policy_mask[inds].sum().clamp(min=1)
+                                            + args.kl_coef * kl_ref_penalty)
+
+                value_loss = 0.5 * (torch.max((mb_resp_values - returns[inds]) ** 2,
+                                              (torch.clamp(mb_resp_values,old_resp_values[inds] - args.cliprange_value,
+                                               old_resp_values[inds] + args.cliprange_value) - returns[inds]) ** 2)
+                                    * resp_value_mask[inds]).sum() / resp_value_mask[inds].sum().clamp(min=1)
+
+                kl = approx_kl_val
+                kl_ref = kl_ref_penalty.detach()
+
+                if stop_ppo:
+                    loss = (policy_loss + args.vf_coef * value_loss + aux_loss) * 0.0
+                else:
+                    loss = (policy_loss + args.vf_coef * value_loss + aux_loss) / args.accumulation_steps
+                loss.backward()
+                policy_loss_sum += policy_loss.item()
+                value_loss_sum += value_loss.item()
+                kl_ref_sum += kl_ref.item()
+                kl_sum += kl.item()
+                clipfrac_sum += clipfrac.item()
+                aux_loss_sum += aux_loss.item()
+                log_count += 1
+                grad_accum_step += 1
+
+                if grad_accum_step % args.accumulation_steps == 0:
+                    clip_grad_norm_(actor_model.parameters(),args.grad_clip)
+                    clip_grad_norm_(critic_model.parameters(),args.grad_clip)
+                    actor_optimizer.step()
+                    critic_optimizer.step()
+                    actor_scheduler.step()
+                    critic_scheduler.step()
+                    actor_optimizer.zero_grad(set_to_none=True)
+                    critic_optimizer.zero_grad(set_to_none=True)
+
+        if grad_accum_step % args.accumulation_steps != 0:
+            clip_grad_norm_(actor_model.parameters(), args.grad_clip)
+            clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+            actor_optimizer.step()
+            critic_optimizer.step()
+            actor_scheduler.step()
+            critic_scheduler.step()
+            actor_optimizer.zero_grad(set_to_none=True)
+            critic_optimizer.zero_grad(set_to_none=True)
+
+        if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(actor_model)
+
+        if is_main_process():
+            critic_loss_val = value_loss_sum / max(log_count, 1)
+            reward_val = rewards.mean().item()
+            approx_kl_val = kl_sum / max(log_count, 1)
+            kl_ref_val = kl_ref_sum / max(log_count, 1)
+            clipfrac_val = clipfrac_sum / max(log_count, 1)
+            avg_len_val = resp_lengths.float().mean().item()
+            actor_lr, critic_lr = actor_optimizer.param_groups[0]['lr'], critic_optimizer.param_groups[0]['lr']
+
+            if wandb is not None:
+                wandb.log({
+                    "reward": reward_val,
+                    "kl_ref": kl_ref_val,
+                    "approx_kl": approx_kl_val,
+                    "clipfrac": clipfrac_val,
+                    "critic_loss": critic_loss_val,
+                    "avg_response_len": avg_len_val,
+                    "actor_lr": actor_lr,
+                    "critic_lr": critic_lr,
+                })
+
+            Logger(f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), "
+                   f"Reward: {reward_val:.4f}, KL_ref: {kl_ref_val:.4f}, Approx KL: {approx_kl_val:.4f}, "
+                   f"ClipFrac: {clipfrac_val:.4f}, Critic Loss: {critic_loss_val:.4f}, "
+                   f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.8f}, Critic LR: {critic_lr:.8f}")
+
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+            actor_model.eval()
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
+            actor_state = raw_actor.state_dict()
+            torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
+
+            # 使用 lm_checkpoint 保存完整状态（包括 critic）
+            lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
+                          scheduler=actor_scheduler, critic_model=critic_model,
+                          critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
+            actor_model.train()
+            del actor_state
+
+        del enc, gen_out, completion_ids, responses_text, rewards, full_mask, values_seq, advantages
+        del labels, resp_labels, resp_idx, valid_mask, resp_lengths, resp_policy_mask, resp_value_mask, old_resp_logp, ref_resp_logp
+        del kl, kl_ref, policy_loss, value_loss, loss, token_rewards, returns, old_resp_values, prompt_lens, logp_pos
 
 
 if __name__ == "__main__":
@@ -107,7 +313,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=768, type=int, help="Prompt最大长度")
-    parser.add_argument("--max_gen_len", type=int, default=1024, help="生成的最大长度")
+    parser.add_argument("--max_gen_len", type=int, default=512, help="生成的最大长度")
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif.jsonl", help="RLAIF数据路径")
     parser.add_argument("--clip_epsilon", type=float, default=0.2, help="PPO裁剪参数")
     parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function系数")
@@ -119,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop_kl", type=float, default=0.25, help="PPO early stop 的 KL 阈值")
     parser.add_argument("--mini_batch_size", type=int, default=2, help="PPO每次更新的minibatch大小")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
+    parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward", help="Reward模型路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO", help="wandb项目名")

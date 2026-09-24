@@ -18,7 +18,7 @@ def apply_lora(model,rank=16):
     for name,module in model.named_modules():
         if isinstance(module,nn.Linear) and module.in_features == module.out_features:
             lora = LoRA(module.in_features,module.out_features,rank).to(model.device)
-            setattr(model,'lora',lora)
+            setattr(module,'lora',lora)
             origin_forward = module.forward
             def new_forward(x,layer1=origin_forward,layer2=lora):
                 return layer1(x) + layer2(x)
@@ -36,10 +36,10 @@ def load_lora(model,path):
 def save_lora(model,path):
     state_dict = {}
     raw_model = getattr(model,'_orig_mod',model)
-    for name,module in model.named_modules():
+    for name,module in raw_model.named_modules():
         if hasattr(module,'lora'):
             clean_name = name[7:] if name.startswith('module.') else name
-            lora_state = {f'{clean_name}.lora.{k}' : v.cpu().half() for k,v in module.lora.state_dict.items()}
+            lora_state = {f'{clean_name}.lora.{k}' : v.cpu().half() for k,v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
 
     torch.save(state_dict,path)
@@ -49,7 +49,7 @@ def merge_lora(model,load_path,save_path):
     load_lora(model,load_path)
     raw_model = getattr(model,'_orig_mod',model)
     state_dict = {k:v.cpu().half() for k,v in raw_model.state_dict().items() if '.lora.' not in k}
-    for name,module in model.named_modules():
+    for name,module in raw_model.named_modules():
         if isinstance(module, nn.Linear) and '.lora.' not in name:
             state_dict[f'{name}.weight'] = module.weight.data.clone().cpu().half()
             if hasattr(module, 'lora'):

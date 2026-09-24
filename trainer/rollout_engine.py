@@ -92,9 +92,16 @@ class TorchRolloutEngine(RolloutEngine):
             per_token_logps = compute_per_token_logps(self.policy_model, output_ids, completion_ids.size(1),
                                                       attention_mask=full_mask)
         completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        completion_pad_mask = (completion_ids != self.tokenizer.pad_token_id).bool() # [B*num_gen, R]
+        eos_mask = completion_ids.eq(self.tokenizer.eos_token_id) # [B*num_gen, R]
+        has_eos = eos_mask.any(dim=1) # [B*num_gen, ]
+        eos_pos = torch.argmax(eos_mask.int(), dim=1) # [B*num_gen, ]
+        resp_lengths = torch.where(has_eos, eos_pos + 1, completion_ids.size(1)).long().clamp(min=1) # [B*num_gen, ]
+        resp_idx = torch.arange(completion_ids.size(1),device=self.device).unsqueeze(0)  # 1,R
+        completion_mask = ((resp_idx < resp_lengths.unsqueeze(1)) & completion_pad_mask).float()  # [B*num_gen, R]
         return RolloutResult(output_ids, completion_ids, per_token_logps, completions,
                              prompt_ids.new_full((output_ids.size(0),), prompt_len),
-                             attention_mask.new_ones(output_ids.size(0), completion_ids.size(1)))
+                             completion_mask)
 
     def update_policy(self, model: torch.nn.Module):
         self.policy_model = model
