@@ -237,3 +237,5 @@ __marimo__/
 
 #params
 checkpoints/*
+
+lab.ipynb
