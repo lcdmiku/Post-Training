@@ -1,5 +1,10 @@
 # Post-Training（大语言模型后训练框架）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-red.svg)](https://pytorch.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/lcdmiku/Post-Training/pulls)
+
 一个基于MiniMind围绕大语言模型（LLM）后训练（Post-Training）的个人学习与实践项目，涵盖监督微调（SFT）与基于 PPO 的强化学习（RLHF）流程。项目采用模块化设计，将数据、模型、训练器分离，便于理解后训练各阶段的实现细节与数据流。
 
 ## 功能特性
